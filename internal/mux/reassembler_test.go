@@ -2,6 +2,7 @@ package mux
 
 import (
 	"bytes"
+	"context"
 	"encoding/binary"
 	"net"
 	"sync"
@@ -458,5 +459,229 @@ func TestReassembler_ConcurrentProcessWithBackpressure(t *testing.T) {
 		assert.Equal(t, totalChunks, received, "should receive all chunks")
 	case <-time.After(10 * time.Second):
 		t.Fatalf("timed out waiting for all chunks: received %d/%d", received, totalChunks)
+	}
+}
+
+// TestReassembler_SoakTest 长时间压力测试，验证 reassembler 在持续高负载下的稳定性
+// 模拟多个会话并发处理，随机乱序到达，持续背压和恢复
+func TestReassembler_SoakTest(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	r := NewReassembler(logger)
+
+	const (
+		numSessions   = 20  // 并发会话数
+		chunksPerSess = 500 // 每个会话的分片数
+		workers       = 10  // 每个会话的发送 goroutine 数
+	)
+
+	// 在 short mode 下减少测试规模
+	testDuration := 5 * time.Second
+	if !testing.Short() {
+		testDuration = 30 * time.Second
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), testDuration+10*time.Second)
+	defer cancel()
+
+	var wg sync.WaitGroup
+	errors := make(chan error, numSessions*2)
+
+	// 为每个会话启动生产者和消费者
+	for s := 0; s < numSessions; s++ {
+		sid := uuid.New()
+
+		// 生产者：并发发送乱序分片
+		wg.Add(1)
+		go func(sessionID uuid.UUID) {
+			defer wg.Done()
+
+			// 生成随机发送顺序
+			order := make([]uint32, chunksPerSess)
+			for i := range order {
+				order[i] = uint32(i)
+			}
+			// 简单打乱：每个元素与随机位置交换
+			for i := range order {
+				j := i + int(time.Now().UnixNano()%(int64(len(order)-i)))
+				order[i], order[j] = order[j], order[i]
+			}
+
+			// 分批发送
+			chunkSize := chunksPerSess / workers
+			var sendWg sync.WaitGroup
+			for w := 0; w < workers; w++ {
+				sendWg.Add(1)
+				go func(workerID int) {
+					defer sendWg.Done()
+					start := workerID * chunkSize
+					end := start + chunkSize
+					if workerID == workers-1 {
+						end = chunksPerSess
+					}
+
+					for i := start; i < end; i++ {
+						select {
+						case <-ctx.Done():
+							return
+						default:
+						}
+
+						seq := order[i]
+						var flags byte
+						if seq == chunksPerSess-1 {
+							flags = FlagFIN
+						}
+						data := make([]byte, 100) // 100 字节分片
+						binary.BigEndian.PutUint32(data, seq)
+
+						if err := r.Process(buildFrame(sessionID, seq, data, flags)); err != nil {
+							select {
+							case errors <- err:
+							default:
+							}
+							return
+						}
+
+						// 随机延迟模拟网络抖动
+						if seq%10 == 0 {
+							time.Sleep(time.Microsecond * time.Duration(seq%100))
+						}
+					}
+				}(w)
+			}
+			sendWg.Wait()
+		}(sid)
+
+		// 消费者：慢速消费模拟背压
+		wg.Add(1)
+		go func(sessionID uuid.UUID) {
+			defer wg.Done()
+
+			// 等待会话创建
+			var output <-chan []byte
+			for i := 0; i < 1000; i++ {
+				output = r.GetOutput(sessionID)
+				if output != nil {
+					break
+				}
+				time.Sleep(time.Millisecond)
+			}
+			if output == nil {
+				select {
+				case errors <- assert.AnError:
+				default:
+				}
+				return
+			}
+
+			received := 0
+			seqMap := make(map[uint32]bool)
+
+			for chunk := range output {
+				select {
+				case <-ctx.Done():
+					return
+				default:
+				}
+
+				// 验证序号
+				seq := binary.BigEndian.Uint32(chunk)
+				if seqMap[seq] {
+					select {
+					case errors <- assert.AnError:
+					default:
+					}
+					return
+				}
+				seqMap[seq] = true
+				received++
+
+				r.OnConsumed(sessionID, len(chunk))
+
+				// 随机慢速消费触发背压
+				if received%50 == 0 {
+					time.Sleep(10 * time.Millisecond)
+				}
+			}
+
+			// 验证收到所有分片
+			if received != chunksPerSess {
+				select {
+				case errors <- assert.AnError:
+				default:
+				}
+			}
+		}(sid)
+	}
+
+	// 等待所有 goroutine 完成
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// 检查是否有错误
+		select {
+		case err := <-errors:
+			t.Fatalf("soak test failed with error: %v", err)
+		default:
+			t.Logf("soak test passed: %d sessions, %d chunks each, %v duration",
+				numSessions, chunksPerSess, testDuration)
+		}
+	case <-time.After(testDuration + 20*time.Second):
+		t.Fatal("soak test timed out")
+	}
+}
+
+// TestReassembler_RandomSequence 模糊测试：随机序列、随机延迟、随机背压
+func TestReassembler_RandomSequence(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	r := NewReassembler(logger)
+
+	const iterations = 100 // 运行 100 次随机测试
+
+	for iter := 0; iter < iterations; iter++ {
+		sid := uuid.New()
+
+		// 随机分片数量 (10-200)
+		numChunks := 10 + int(time.Now().UnixNano()%190)
+
+		// 生成随机发送顺序
+		order := make([]uint32, numChunks)
+		for i := range order {
+			order[i] = uint32(i)
+		}
+		for i := range order {
+			j := i + int(time.Now().UnixNano()%(int64(len(order)-i)))
+			order[i], order[j] = order[j], order[i]
+		}
+
+		// 发送所有分片
+		for _, seq := range order {
+			var flags byte
+			if seq == uint32(numChunks-1) {
+				flags = FlagFIN
+			}
+			data := []byte{byte(seq % 256), byte(seq / 256)}
+			err := r.Process(buildFrame(sid, seq, data, flags))
+			require.NoError(t, err, "iteration %d, seq %d", iter, seq)
+		}
+
+		// 消费并验证
+		output := r.GetOutput(sid)
+		require.NotNil(t, output, "iteration %d", iter)
+
+		received := 0
+		for chunk := range output {
+			seq := uint32(chunk[0]) + uint32(chunk[1])*256
+			assert.Equal(t, uint32(received), seq, "iteration %d: out of order", iter)
+			received++
+			r.OnConsumed(sid, len(chunk))
+		}
+
+		assert.Equal(t, numChunks, received, "iteration %d: missing chunks", iter)
 	}
 }
