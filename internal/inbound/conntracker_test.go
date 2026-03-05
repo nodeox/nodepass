@@ -79,6 +79,32 @@ func TestConnTracker_CloseAllIdempotent(t *testing.T) {
 	ct.CloseAll()
 }
 
+func TestConnTracker_AddAfterCloseAll(t *testing.T) {
+	ct := newConnTracker()
+
+	c1a, c1b := net.Pipe()
+	defer c1b.Close()
+
+	ct.Add(c1a)
+	ct.CloseAll()
+
+	// Adding after CloseAll should immediately close the new connection
+	c2a, c2b := net.Pipe()
+	defer c2b.Close()
+
+	remove := ct.Add(c2a)
+	remove() // should be a no-op
+
+	// c2a should be closed
+	_, err := c2a.Write([]byte("test"))
+	assert.Error(t, err, "connection added after CloseAll should be immediately closed")
+
+	// Tracker should still be empty
+	ct.mu.Lock()
+	assert.Len(t, ct.conns, 0)
+	ct.mu.Unlock()
+}
+
 func TestConnTracker_ConcurrentAddAndCloseAll(t *testing.T) {
 	ct := newConnTracker()
 
