@@ -124,6 +124,143 @@ func TestValidateConfig(t *testing.T) {
 			wantErr: true,
 			errMsg:  "listen invalid",
 		},
+		{
+			name: "invalid inbound protocol",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "http", Listen: "0.0.0.0:1080"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "protocol invalid",
+		},
+		{
+			name: "tls missing cert",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "tls", Listen: "0.0.0.0:1080"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "requires tls.cert and tls.key",
+		},
+		{
+			name: "quic missing cert",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "quic", Listen: "0.0.0.0:1080"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "requires tls.cert and tls.key",
+		},
+		{
+			name: "forward missing target",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "forward", Listen: "0.0.0.0:1080"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "requires target",
+		},
+		{
+			name: "duplicate listen address",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "tcp", Listen: "0.0.0.0:1080"},
+					{Protocol: "tcp", Listen: "0.0.0.0:1080"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "listen duplicate",
+		},
+		{
+			name: "invalid outbound protocol",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Outbounds: []common.OutboundConfig{
+					{Name: "out1", Protocol: "socks5"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "protocol invalid",
+		},
+		{
+			name: "np-chain outbound missing address",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Outbounds: []common.OutboundConfig{
+					{Name: "out1", Protocol: "np-chain"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "requires address",
+		},
+		{
+			name: "duplicate outbound name",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Outbounds: []common.OutboundConfig{
+					{Name: "out1", Protocol: "direct"},
+					{Name: "out1", Protocol: "direct"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "name duplicate",
+		},
+		{
+			name: "np-chain outbound transport quic rejected",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test-node",
+					Type: "ingress",
+				},
+				Outbounds: []common.OutboundConfig{
+					{Name: "out1", Protocol: "np-chain", Address: "1.2.3.4:5678", Transport: "quic"},
+				},
+			},
+			wantErr: true,
+			errMsg:  "does not support transport=quic",
+		},
 	}
 
 	for _, tt := range tests {

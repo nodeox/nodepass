@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"io"
 	"sync"
+	"sync/atomic"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -25,7 +26,8 @@ type SessionBuffer struct {
 	output   chan []byte
 	flowCtrl *WindowFlowController
 
-	mu sync.Mutex
+	retrying atomic.Bool
+	mu       sync.Mutex
 }
 
 // NewReassembler 创建重组器
@@ -131,12 +133,53 @@ func (r *Reassembler) tryReassemble(sb *SessionBuffer) error {
 			}
 
 		default:
-			// 输出通道满，暂停
+			// 输出通道满，启动背压恢复 goroutine
+			if sb.retrying.CompareAndSwap(false, true) {
+				go r.retryReassemble(sb)
+			}
 			return nil
 		}
 	}
 
 	return nil
+}
+
+// retryReassemble 在背压恢复后重试推送缓存的有序分片
+func (r *Reassembler) retryReassemble(sb *SessionBuffer) {
+	defer sb.retrying.Store(false)
+
+	for {
+		// 取出下一个待发送的 chunk（锁内读取状态）
+		sb.mu.Lock()
+		chunk, ok := sb.chunks[sb.nextSeq]
+		if !ok {
+			sb.mu.Unlock()
+			return
+		}
+		seq := sb.nextSeq
+		sb.mu.Unlock()
+
+		// 阻塞等待消费者腾出空间
+		sb.output <- chunk
+
+		// 确认并更新状态
+		sb.mu.Lock()
+		// 确认 nextSeq 未被其他 goroutine 更改
+		if sb.nextSeq != seq {
+			sb.mu.Unlock()
+			return
+		}
+		sb.flowCtrl.OnBuffered(len(chunk))
+		delete(sb.chunks, seq)
+		sb.nextSeq++
+
+		if sb.finSeq >= 0 && int64(seq) == sb.finSeq {
+			close(sb.output)
+			sb.mu.Unlock()
+			return
+		}
+		sb.mu.Unlock()
+	}
 }
 
 // GetOutput 获取会话的输出通道

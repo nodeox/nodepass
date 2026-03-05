@@ -20,6 +20,7 @@ type ForwardInbound struct {
 	logger *zap.Logger
 
 	listener net.Listener
+	tracker  *connTracker
 	ready    chan struct{}
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -33,10 +34,11 @@ func NewForward(cfg common.InboundConfig, logger *zap.Logger) (*ForwardInbound, 
 	}
 
 	return &ForwardInbound{
-		listen: cfg.Listen,
-		target: cfg.Target,
-		logger: logger.With(zap.String("inbound", "forward")),
-		ready:  make(chan struct{}),
+		listen:  cfg.Listen,
+		target:  cfg.Target,
+		logger:  logger.With(zap.String("inbound", "forward")),
+		tracker: newConnTracker(),
+		ready:   make(chan struct{}),
 	}, nil
 }
 
@@ -79,6 +81,9 @@ func (f *ForwardInbound) Start(ctx context.Context, router common.Router) error 
 func (f *ForwardInbound) handleConnection(conn net.Conn) {
 	defer conn.Close()
 
+	removeConn := f.tracker.Add(conn)
+	defer removeConn()
+
 	targetConn, err := net.DialTimeout("tcp", f.target, 10*time.Second)
 	if err != nil {
 		f.logger.Debug("dial target failed",
@@ -88,6 +93,9 @@ func (f *ForwardInbound) handleConnection(conn net.Conn) {
 		return
 	}
 	defer targetConn.Close()
+
+	removeTarget := f.tracker.Add(targetConn)
+	defer removeTarget()
 
 	f.logger.Debug("forward relay established",
 		zap.String("source", conn.RemoteAddr().String()),
@@ -104,7 +112,17 @@ func (f *ForwardInbound) Stop() error {
 	if f.listener != nil {
 		f.listener.Close()
 	}
-	f.wg.Wait()
+	f.tracker.CloseAll()
+	done := make(chan struct{})
+	go func() {
+		f.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		f.logger.Warn("forward inbound stop timed out after 10s")
+	}
 	f.logger.Info("forward inbound stopped")
 	return nil
 }

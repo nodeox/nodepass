@@ -221,13 +221,17 @@ func (s *Server) GetConfig(req *GetConfigRequest) (*GetConfigResponse, error) {
 }
 
 // SetNodeConfig 设置节点配置（由管理端调用）
-func (s *Server) SetNodeConfig(nodeID string, configData []byte) error {
+func (s *Server) SetNodeConfig(nodeID, token string, configData []byte) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 
 	node, ok := s.nodes[nodeID]
 	if !ok {
 		return fmt.Errorf("node not found: %s", nodeID)
+	}
+
+	if node.Token != token {
+		return &AuthError{Message: "invalid token"}
 	}
 
 	node.ConfigVersion++
@@ -239,6 +243,15 @@ func (s *Server) SetNodeConfig(nodeID string, configData []byte) error {
 	)
 
 	return nil
+}
+
+// AuthError represents an authentication error
+type AuthError struct {
+	Message string
+}
+
+func (e *AuthError) Error() string {
+	return e.Message
 }
 
 // ListNodes 列出所有节点
@@ -414,6 +427,7 @@ func (s *Server) handleGetConfig(w http.ResponseWriter, r *http.Request) {
 // SetConfigRequest 设置节点配置请求
 type SetConfigRequest struct {
 	NodeID     string `json:"node_id"`
+	Token      string `json:"token"`
 	ConfigData []byte `json:"config_data"`
 }
 
@@ -429,7 +443,11 @@ func (s *Server) handleSetConfig(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	if err := s.SetNodeConfig(req.NodeID, req.ConfigData); err != nil {
+	if err := s.SetNodeConfig(req.NodeID, req.Token, req.ConfigData); err != nil {
+		if _, ok := err.(*AuthError); ok {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": err.Error()})
+			return
+		}
 		writeJSON(w, http.StatusNotFound, map[string]string{"error": err.Error()})
 		return
 	}

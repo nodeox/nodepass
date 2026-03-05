@@ -244,7 +244,7 @@ func TestServer_GetConfig(t *testing.T) {
 
 	// 设置配置
 	configData := []byte(`{"version":"2.0","node":{"id":"node-1"}}`)
-	err = srv.SetNodeConfig("node-1", configData)
+	err = srv.SetNodeConfig("node-1", regResp.Token, configData)
 	require.NoError(t, err)
 
 	// 获取配置（版本 0 → 应该返回更新）
@@ -308,14 +308,16 @@ func TestServer_GetConfigInvalidToken(t *testing.T) {
 func TestServer_SetConfig(t *testing.T) {
 	srv, baseURL := setupTestServer(t)
 
-	srv.Register(&RegisterRequest{
+	regResp, err := srv.Register(&RegisterRequest{
 		NodeID:   "node-1",
 		NodeType: "ingress",
 	})
+	require.NoError(t, err)
 
 	configData := []byte(`{"version":"2.0"}`)
 	resp := postJSON(t, baseURL+"/api/v1/config/set", SetConfigRequest{
 		NodeID:     "node-1",
+		Token:      regResp.Token,
 		ConfigData: configData,
 	})
 	defer resp.Body.Close()
@@ -329,7 +331,7 @@ func TestServer_SetConfig(t *testing.T) {
 	assert.Equal(t, configData, node.ConfigData)
 
 	// 再次设置，版本应递增到 2
-	err := srv.SetNodeConfig("node-1", []byte(`{"version":"2.1"}`))
+	err = srv.SetNodeConfig("node-1", regResp.Token, []byte(`{"version":"2.1"}`))
 	require.NoError(t, err)
 
 	node, _ = srv.GetNode("node-1")
@@ -341,9 +343,33 @@ func TestServer_SetConfigUnknownNode(t *testing.T) {
 
 	resp := postJSON(t, baseURL+"/api/v1/config/set", SetConfigRequest{
 		NodeID:     "unknown",
+		Token:      "any-token",
 		ConfigData: []byte("{}"),
 	})
 	defer resp.Body.Close()
 
 	assert.Equal(t, http.StatusNotFound, resp.StatusCode)
+}
+
+func TestServer_SetConfigInvalidToken(t *testing.T) {
+	srv, baseURL := setupTestServer(t)
+
+	srv.Register(&RegisterRequest{
+		NodeID:   "node-1",
+		NodeType: "ingress",
+	})
+
+	resp := postJSON(t, baseURL+"/api/v1/config/set", SetConfigRequest{
+		NodeID:     "node-1",
+		Token:      "wrong-token",
+		ConfigData: []byte(`{"version":"2.0"}`),
+	})
+	defer resp.Body.Close()
+
+	assert.Equal(t, http.StatusUnauthorized, resp.StatusCode)
+
+	// Verify config was not changed
+	node, ok := srv.GetNode("node-1")
+	require.True(t, ok)
+	assert.Equal(t, int64(0), node.ConfigVersion)
 }

@@ -15,11 +15,10 @@ import (
 // NPChainOutbound NP-Chain 协议出站处理器
 // 将流量封装为 NP-Chain 协议帧发送到下一跳节点
 type NPChainOutbound struct {
-	name      string
-	group     string
-	address   string
-	transport string // "tcp" or "quic"
-	logger    *zap.Logger
+	name    string
+	group   string
+	address string
+	logger  *zap.Logger
 }
 
 // NewNPChain 创建 NP-Chain 出站
@@ -28,17 +27,11 @@ func NewNPChain(cfg common.OutboundConfig, logger *zap.Logger) (*NPChainOutbound
 		return nil, fmt.Errorf("np-chain outbound requires address")
 	}
 
-	transport := cfg.Transport
-	if transport == "" {
-		transport = "tcp"
-	}
-
 	return &NPChainOutbound{
-		name:      cfg.Name,
-		group:     cfg.Group,
-		address:   cfg.Address,
-		transport: transport,
-		logger:    logger,
+		name:    cfg.Name,
+		group:   cfg.Group,
+		address: cfg.Address,
+		logger:  logger,
 	}, nil
 }
 
@@ -53,7 +46,6 @@ func (n *NPChainOutbound) Dial(ctx context.Context, meta common.SessionMeta) (ne
 		zap.String("outbound", n.name),
 		zap.String("address", n.address),
 		zap.String("target", meta.Target),
-		zap.String("transport", n.transport),
 	)
 
 	// 连接到下一跳

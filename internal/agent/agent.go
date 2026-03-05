@@ -264,16 +264,16 @@ func (a *Agent) ReloadConfig(newCfg *common.Config) error {
 
 	a.logger.Info("config changes detected", zap.String("changes", diff.String()))
 
-	// 原子替换配置
-	a.config.Store(newCfg)
-
-	// 应用配置差异
-	if err := a.applyConfigDiff(diff); err != nil {
+	// Prepare 阶段：创建所有新对象，任何失败立即返回，不修改运行态
+	prep, err := a.prepareDiff(diff, newCfg)
+	if err != nil {
 		observability.ConfigReloadErrorsTotal.Inc()
-		// 回滚配置
-		a.config.Store(oldCfg)
-		return fmt.Errorf("failed to apply config: %w", err)
+		return fmt.Errorf("failed to prepare config: %w", err)
 	}
+
+	// Commit 阶段：原子替换配置并应用变更
+	a.config.Store(newCfg)
+	a.commitDiff(prep)
 
 	observability.ConfigReloadTotal.Inc()
 	a.logger.Info("config reloaded successfully")
@@ -313,15 +313,73 @@ func (a *Agent) initOutbounds(cfg *common.Config) error {
 	return nil
 }
 
-// applyConfigDiff 应用配置差异
-func (a *Agent) applyConfigDiff(diff *ConfigDiff) error {
+// prepareResult holds pre-created objects for a config diff commit.
+type prepareResult struct {
+	removeInbounds  []string
+	newInbounds     map[string]common.InboundHandler
+	removeOutbounds []string
+	newOutbounds    map[string]common.OutboundHandler
+	routingChanged  bool
+	routingRules    []common.RoutingRule
+}
+
+// prepareDiff creates all new handlers without modifying running state.
+// If any creation fails, nothing has been changed.
+func (a *Agent) prepareDiff(diff *ConfigDiff, cfg *common.Config) (*prepareResult, error) {
+	prep := &prepareResult{
+		removeInbounds:  diff.RemovedInbounds,
+		newInbounds:     make(map[string]common.InboundHandler),
+		removeOutbounds: diff.RemovedOutbounds,
+		newOutbounds:    make(map[string]common.OutboundHandler),
+		routingChanged:  diff.RoutingChanged,
+		routingRules:    cfg.Routing.Rules,
+	}
+
+	// Pre-create updated + added inbounds
+	for _, inCfg := range diff.UpdatedInbounds {
+		newIb, err := inbound.New(inCfg, a.logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create updated inbound %s: %w", inCfg.Listen, err)
+		}
+		prep.newInbounds[inCfg.Listen] = newIb
+	}
+
+	for _, inCfg := range diff.AddedInbounds {
+		newIb, err := inbound.New(inCfg, a.logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create new inbound %s: %w", inCfg.Listen, err)
+		}
+		prep.newInbounds[inCfg.Listen] = newIb
+	}
+
+	// Pre-create updated + added outbounds
+	for _, outCfg := range diff.UpdatedOutbounds {
+		newOut, err := outbound.New(outCfg, a.logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create updated outbound %s: %w", outCfg.Name, err)
+		}
+		prep.newOutbounds[outCfg.Name] = newOut
+	}
+
+	for _, outCfg := range diff.AddedOutbounds {
+		newOut, err := outbound.New(outCfg, a.logger)
+		if err != nil {
+			return nil, fmt.Errorf("failed to create new outbound %s: %w", outCfg.Name, err)
+		}
+		prep.newOutbounds[outCfg.Name] = newOut
+	}
+
+	return prep, nil
+}
+
+// commitDiff applies prepared changes to the running state.
+// This phase only does stop-old/register-new/start-new, which should not fail.
+func (a *Agent) commitDiff(prep *prepareResult) {
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	cfg := a.config.Load().(*common.Config)
-
-	// 1. 停止并删除已移除的入站
-	for _, listen := range diff.RemovedInbounds {
+	// 1. Stop and remove old inbounds (removed + updated)
+	for _, listen := range prep.removeInbounds {
 		if ib, ok := a.inbounds[listen]; ok {
 			a.logger.Info("removing inbound", zap.String("listen", listen))
 			if err := ib.Stop(); err != nil {
@@ -334,9 +392,8 @@ func (a *Agent) applyConfigDiff(diff *ConfigDiff) error {
 		}
 	}
 
-	// 2. 停止旧的、创建并启动更新的入站
-	for _, inCfg := range diff.UpdatedInbounds {
-		listen := inCfg.Listen
+	// Stop old inbounds that are being updated (they have replacements in newInbounds)
+	for listen := range prep.newInbounds {
 		if oldIb, ok := a.inbounds[listen]; ok {
 			a.logger.Info("updating inbound", zap.String("listen", listen))
 			if err := oldIb.Stop(); err != nil {
@@ -347,19 +404,18 @@ func (a *Agent) applyConfigDiff(diff *ConfigDiff) error {
 			}
 			delete(a.inbounds, listen)
 		}
+	}
 
-		newIb, err := inbound.New(inCfg, a.logger)
-		if err != nil {
-			return fmt.Errorf("failed to create updated inbound %s: %w", listen, err)
-		}
-
+	// 2. Register and start new inbounds
+	for listen, newIb := range prep.newInbounds {
+		a.logger.Info("starting inbound", zap.String("listen", listen))
 		a.inbounds[listen] = newIb
 		a.wg.Add(1)
 		go func(handler common.InboundHandler, addr string) {
 			defer a.wg.Done()
 			if err := handler.Start(a.ctx, a.router); err != nil {
 				if a.ctx.Err() == nil {
-					a.logger.Error("updated inbound exited with error",
+					a.logger.Error("inbound exited with error",
 						zap.String("listen", addr),
 						zap.Error(err),
 					)
@@ -368,73 +424,34 @@ func (a *Agent) applyConfigDiff(diff *ConfigDiff) error {
 		}(newIb, listen)
 	}
 
-	// 3. 创建并启动新增的入站
-	for _, inCfg := range diff.AddedInbounds {
-		listen := inCfg.Listen
-		a.logger.Info("adding inbound", zap.String("listen", listen))
-
-		newIb, err := inbound.New(inCfg, a.logger)
-		if err != nil {
-			return fmt.Errorf("failed to create new inbound %s: %w", listen, err)
-		}
-
-		a.inbounds[listen] = newIb
-		a.wg.Add(1)
-		go func(handler common.InboundHandler, addr string) {
-			defer a.wg.Done()
-			if err := handler.Start(a.ctx, a.router); err != nil {
-				if a.ctx.Err() == nil {
-					a.logger.Error("new inbound exited with error",
-						zap.String("listen", addr),
-						zap.Error(err),
-					)
-				}
-			}
-		}(newIb, listen)
-	}
-
-	// 4. 移除已删除的出站（同时从 router 移除）
-	for _, name := range diff.RemovedOutbounds {
+	// 3. Remove old outbounds
+	for _, name := range prep.removeOutbounds {
 		a.logger.Info("removing outbound", zap.String("name", name))
 		a.router.RemoveOutbound(name)
 		delete(a.outbounds, name)
 	}
 
-	// 5. 替换更新的出站（先移除旧的再添加新的）
-	for _, outCfg := range diff.UpdatedOutbounds {
-		a.logger.Info("updating outbound", zap.String("name", outCfg.Name))
-		a.router.RemoveOutbound(outCfg.Name)
-		delete(a.outbounds, outCfg.Name)
-
-		newOut, err := outbound.New(outCfg, a.logger)
-		if err != nil {
-			return fmt.Errorf("failed to create updated outbound %s: %w", outCfg.Name, err)
+	// Stop old outbounds that are being updated
+	for name := range prep.newOutbounds {
+		if _, ok := a.outbounds[name]; ok {
+			a.logger.Info("updating outbound", zap.String("name", name))
+			a.router.RemoveOutbound(name)
+			delete(a.outbounds, name)
 		}
+	}
 
-		a.outbounds[outCfg.Name] = newOut
+	// 4. Register new outbounds
+	for name, newOut := range prep.newOutbounds {
+		a.logger.Info("adding outbound", zap.String("name", name))
+		a.outbounds[name] = newOut
 		a.router.AddOutbound(newOut)
 	}
 
-	// 6. 添加新增的出站（注册到 router）
-	for _, outCfg := range diff.AddedOutbounds {
-		a.logger.Info("adding outbound", zap.String("name", outCfg.Name))
-
-		newOut, err := outbound.New(outCfg, a.logger)
-		if err != nil {
-			return fmt.Errorf("failed to create new outbound %s: %w", outCfg.Name, err)
-		}
-
-		a.outbounds[outCfg.Name] = newOut
-		a.router.AddOutbound(newOut)
-	}
-
-	// 7. 如果路由规则变化，更新 router 规则
-	if diff.RoutingChanged {
+	// 5. Update routing rules if changed
+	if prep.routingChanged {
 		a.logger.Info("updating routing rules")
-		a.router.UpdateRules(cfg.Routing.Rules)
+		a.router.UpdateRules(prep.routingRules)
 	}
-
-	return nil
 }
 
 // SetConfigPath 设置配置文件路径（启用配置热更新）

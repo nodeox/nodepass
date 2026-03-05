@@ -73,7 +73,6 @@ func TestNPChainOutbound_Dial(t *testing.T) {
 
 	assert.Equal(t, "relay-1", out.Name())
 	assert.Equal(t, "relay", out.Group())
-	assert.Equal(t, "tcp", out.transport)
 
 	ctx := context.Background()
 	conn, err := out.Dial(ctx, common.SessionMeta{
@@ -105,25 +104,6 @@ func TestNPChainOutbound_MissingAddress(t *testing.T) {
 	}, logger)
 	assert.Error(t, err)
 	assert.Contains(t, err.Error(), "requires address")
-}
-
-func TestNPChainOutbound_DefaultTransport(t *testing.T) {
-	logger, _ := zap.NewDevelopment()
-
-	out, err := NewNPChain(common.OutboundConfig{
-		Name:    "test",
-		Address: "10.0.0.1:443",
-	}, logger)
-	require.NoError(t, err)
-	assert.Equal(t, "tcp", out.transport)
-
-	out2, err := NewNPChain(common.OutboundConfig{
-		Name:      "test2",
-		Address:   "10.0.0.1:443",
-		Transport: "quic",
-	}, logger)
-	require.NoError(t, err)
-	assert.Equal(t, "quic", out2.transport)
 }
 
 func TestNPChainOutbound_DialFail(t *testing.T) {

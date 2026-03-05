@@ -7,6 +7,7 @@ import (
 	"io"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/nodeox/nodepass/internal/common"
 	"github.com/nodeox/nodepass/internal/observability"
@@ -16,8 +17,14 @@ import (
 
 // handleNPChainStream 处理 NP-Chain 帧流的公共逻辑
 // 所有传输层入站（TCP/TLS/WS/QUIC）共用此方法
-func handleNPChainStream(ctx context.Context, conn net.Conn, router common.Router, logger *zap.Logger) {
+func handleNPChainStream(ctx context.Context, conn net.Conn, router common.Router, logger *zap.Logger, ct *connTracker) {
 	defer conn.Close()
+
+	// Track the inbound connection
+	if ct != nil {
+		removeConn := ct.Add(conn)
+		defer removeConn()
+	}
 
 	// 读取帧长度 (2 bytes big-endian)
 	lenBuf := make([]byte, 2)
@@ -85,6 +92,12 @@ func handleNPChainStream(ctx context.Context, conn net.Conn, router common.Route
 	}
 	defer targetConn.Close()
 
+	// Track the target connection too
+	if ct != nil {
+		removeTarget := ct.Add(targetConn)
+		defer removeTarget()
+	}
+
 	logger.Debug("relay established",
 		zap.String("session_id", sessionID.String()),
 		zap.String("outbound", out.Name()),
@@ -128,6 +141,7 @@ type TCPInbound struct {
 	logger   *zap.Logger
 	listener net.Listener
 	router   common.Router
+	tracker  *connTracker
 	ready    chan struct{}
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -137,9 +151,10 @@ type TCPInbound struct {
 // NewTCP 创建 TCP 入站
 func NewTCP(cfg common.InboundConfig, logger *zap.Logger) (*TCPInbound, error) {
 	return &TCPInbound{
-		listen: cfg.Listen,
-		logger: logger.With(zap.String("inbound", "tcp")),
-		ready:  make(chan struct{}),
+		listen:  cfg.Listen,
+		logger:  logger.With(zap.String("inbound", "tcp")),
+		tracker: newConnTracker(),
+		ready:   make(chan struct{}),
 	}, nil
 }
 
@@ -172,7 +187,7 @@ func (t *TCPInbound) Start(ctx context.Context, router common.Router) error {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			handleNPChainStream(t.ctx, conn, t.router, t.logger)
+			handleNPChainStream(t.ctx, conn, t.router, t.logger, t.tracker)
 		}()
 	}
 }
@@ -184,7 +199,17 @@ func (t *TCPInbound) Stop() error {
 	if t.listener != nil {
 		t.listener.Close()
 	}
-	t.wg.Wait()
+	t.tracker.CloseAll()
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.logger.Warn("tcp inbound stop timed out after 10s")
+	}
 	t.logger.Info("tcp inbound stopped")
 	return nil
 }

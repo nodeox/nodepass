@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/nodeox/nodepass/internal/common"
 	"github.com/nodeox/nodepass/internal/observability"
@@ -21,6 +22,7 @@ type QUICInbound struct {
 	logger    *zap.Logger
 	listener  *quic.Listener
 	router    common.Router
+	tracker   *connTracker
 	ready     chan struct{}
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -48,6 +50,7 @@ func NewQUIC(cfg common.InboundConfig, logger *zap.Logger) (*QUICInbound, error)
 		listen:    cfg.Listen,
 		tlsConfig: tlsCfg,
 		logger:    logger.With(zap.String("inbound", "quic")),
+		tracker:   newConnTracker(),
 		ready:     make(chan struct{}),
 	}, nil
 }
@@ -104,7 +107,7 @@ func (q *QUICInbound) handleConn(conn *quic.Conn) {
 		go func(s *quic.Stream) {
 			defer q.wg.Done()
 			netConn := transport.NewQUICConn(s, conn)
-			handleNPChainStream(q.ctx, netConn, q.router, q.logger)
+			handleNPChainStream(q.ctx, netConn, q.router, q.logger, q.tracker)
 		}(stream)
 	}
 }
@@ -116,7 +119,17 @@ func (q *QUICInbound) Stop() error {
 	if q.listener != nil {
 		q.listener.Close()
 	}
-	q.wg.Wait()
+	q.tracker.CloseAll()
+	done := make(chan struct{})
+	go func() {
+		q.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		q.logger.Warn("quic inbound stop timed out after 10s")
+	}
 	q.logger.Info("quic inbound stopped")
 	return nil
 }

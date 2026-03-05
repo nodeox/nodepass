@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/nodeox/nodepass/internal/common"
 	"github.com/nodeox/nodepass/internal/observability"
@@ -19,6 +20,7 @@ type TLSInbound struct {
 	logger    *zap.Logger
 	listener  net.Listener
 	router    common.Router
+	tracker   *connTracker
 	ready     chan struct{}
 	ctx       context.Context
 	cancel    context.CancelFunc
@@ -45,6 +47,7 @@ func NewTLS(cfg common.InboundConfig, logger *zap.Logger) (*TLSInbound, error) {
 		listen:    cfg.Listen,
 		tlsConfig: tlsCfg,
 		logger:    logger.With(zap.String("inbound", "tls")),
+		tracker:   newConnTracker(),
 		ready:     make(chan struct{}),
 	}, nil
 }
@@ -78,7 +81,7 @@ func (t *TLSInbound) Start(ctx context.Context, router common.Router) error {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			handleNPChainStream(t.ctx, conn, t.router, t.logger)
+			handleNPChainStream(t.ctx, conn, t.router, t.logger, t.tracker)
 		}()
 	}
 }
@@ -90,7 +93,17 @@ func (t *TLSInbound) Stop() error {
 	if t.listener != nil {
 		t.listener.Close()
 	}
-	t.wg.Wait()
+	t.tracker.CloseAll()
+	done := make(chan struct{})
+	go func() {
+		t.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.logger.Warn("tls inbound stop timed out after 10s")
+	}
 	t.logger.Info("tls inbound stopped")
 	return nil
 }

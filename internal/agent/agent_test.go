@@ -468,3 +468,61 @@ node:
 	currentCfg := ag.GetConfig()
 	assert.Equal(t, "egress", currentCfg.Node.Type)
 }
+
+func TestReloadConfig_PartialFailureNoSideEffects(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+
+	// Initial config with one outbound
+	cfg := &common.Config{
+		Version: "2.0",
+		Node: common.NodeConfig{
+			ID:   "test-node",
+			Type: "ingress",
+		},
+		Outbounds: []common.OutboundConfig{
+			{Name: "direct-1", Protocol: "direct", Group: "default"},
+		},
+	}
+
+	ag, err := New(cfg, logger)
+	require.NoError(t, err)
+
+	ctx := context.Background()
+	err = ag.Start(ctx)
+	require.NoError(t, err)
+	defer ag.Stop()
+
+	// Record original state
+	origOutboundCount := len(ag.outbounds)
+	origInboundCount := len(ag.inbounds)
+
+	// New config: adds a valid inbound change AND an invalid outbound (np-chain without address)
+	newCfg := &common.Config{
+		Version: "2.0",
+		Node: common.NodeConfig{
+			ID:   "test-node",
+			Type: "ingress",
+		},
+		Inbounds: []common.InboundConfig{
+			{Protocol: "tcp", Listen: "127.0.0.1:0"},
+		},
+		Outbounds: []common.OutboundConfig{
+			{Name: "direct-1", Protocol: "direct", Group: "default"},
+			{Name: "chain-1", Protocol: "np-chain"}, // invalid: missing address
+		},
+	}
+
+	// ReloadConfig should fail because np-chain outbound has no address
+	err = ag.ReloadConfig(newCfg)
+	assert.Error(t, err)
+
+	// Verify original state is unchanged — prepare phase failed, nothing was modified
+	ag.mu.RLock()
+	assert.Equal(t, origInboundCount, len(ag.inbounds), "inbound count should not change after failed reload")
+	assert.Equal(t, origOutboundCount, len(ag.outbounds), "outbound count should not change after failed reload")
+	ag.mu.RUnlock()
+
+	// Verify config was not updated
+	currentCfg := ag.GetConfig()
+	assert.Equal(t, cfg, currentCfg, "config should not change after failed reload")
+}

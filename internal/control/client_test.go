@@ -51,7 +51,7 @@ func TestClient_GetConfig(t *testing.T) {
 
 	// 服务端设置配置
 	configData := []byte(`{"version":"2.0","node":{"id":"client-node"}}`)
-	err = srv.SetNodeConfig("client-node", configData)
+	err = srv.SetNodeConfig("client-node", client.Token(), configData)
 	require.NoError(t, err)
 
 	// 客户端拉取 → 应该有更新

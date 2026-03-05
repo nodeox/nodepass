@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"net"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/stretchr/testify/assert"
@@ -212,4 +214,73 @@ func TestReassembler_AggregatorIntegration(t *testing.T) {
 	}
 
 	assert.Equal(t, original, result)
+}
+
+func TestReassembler_BackpressureRecovery(t *testing.T) {
+	logger, _ := zap.NewDevelopment()
+	r := NewReassembler(logger)
+
+	sid := uuid.New()
+
+	// The output channel has capacity 100.
+	// Fill it with 100 ordered chunks (seq 0..99).
+	for i := uint32(0); i < 100; i++ {
+		data := []byte{byte(i)}
+		err := r.Process(buildFrame(sid, i, data, 0))
+		require.NoError(t, err)
+	}
+
+	output := r.GetOutput(sid)
+	require.NotNil(t, output)
+
+	// Verify channel is full: all 100 chunks should be in the channel
+	assert.Equal(t, 100, len(output))
+
+	// Send chunk 100 — this triggers backpressure (channel is full),
+	// which should start the retry goroutine
+	err := r.Process(buildFrame(sid, 100, []byte{100}, 0))
+	require.NoError(t, err)
+
+	// Now consume 50 chunks to free up space
+	for i := 0; i < 50; i++ {
+		chunk := <-output
+		assert.Equal(t, []byte{byte(i)}, chunk)
+		r.OnConsumed(sid, len(chunk))
+	}
+
+	// Wait a bit for the retry goroutine to push backpressured chunks
+	time.Sleep(200 * time.Millisecond)
+
+	// Now send the FIN chunk (seq 101)
+	err = r.Process(buildFrame(sid, 101, []byte{101}, FlagFIN))
+	require.NoError(t, err)
+
+	// Consume remaining chunks
+	var remaining []byte
+	var wg sync.WaitGroup
+	wg.Add(1)
+	go func() {
+		defer wg.Done()
+		for chunk := range output {
+			remaining = append(remaining, chunk...)
+			r.OnConsumed(sid, len(chunk))
+		}
+	}()
+
+	// Wait for completion with timeout
+	done := make(chan struct{})
+	go func() {
+		wg.Wait()
+		close(done)
+	}()
+
+	select {
+	case <-done:
+		// Success
+	case <-time.After(5 * time.Second):
+		t.Fatal("backpressure recovery timed out — chunks were not delivered")
+	}
+
+	// Verify we got all remaining chunks (50..101)
+	assert.Equal(t, 52, len(remaining), "should have received chunks 50..101")
 }

@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/gobwas/ws"
 	"github.com/nodeox/nodepass/internal/common"
@@ -18,6 +19,7 @@ type WSInbound struct {
 	logger   *zap.Logger
 	listener net.Listener
 	router   common.Router
+	tracker  *connTracker
 	ready    chan struct{}
 	ctx      context.Context
 	cancel   context.CancelFunc
@@ -27,9 +29,10 @@ type WSInbound struct {
 // NewWS 创建 WebSocket 入站
 func NewWS(cfg common.InboundConfig, logger *zap.Logger) (*WSInbound, error) {
 	return &WSInbound{
-		listen: cfg.Listen,
-		logger: logger.With(zap.String("inbound", "ws")),
-		ready:  make(chan struct{}),
+		listen:  cfg.Listen,
+		logger:  logger.With(zap.String("inbound", "ws")),
+		tracker: newConnTracker(),
+		ready:   make(chan struct{}),
 	}, nil
 }
 
@@ -73,7 +76,7 @@ func (w *WSInbound) Start(ctx context.Context, router common.Router) error {
 			}
 
 			wsc := newWSConn(c)
-			handleNPChainStream(w.ctx, wsc, w.router, w.logger)
+			handleNPChainStream(w.ctx, wsc, w.router, w.logger, w.tracker)
 		}(conn)
 	}
 }
@@ -85,7 +88,17 @@ func (w *WSInbound) Stop() error {
 	if w.listener != nil {
 		w.listener.Close()
 	}
-	w.wg.Wait()
+	w.tracker.CloseAll()
+	done := make(chan struct{})
+	go func() {
+		w.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		w.logger.Warn("ws inbound stop timed out after 10s")
+	}
 	w.logger.Info("ws inbound stopped")
 	return nil
 }

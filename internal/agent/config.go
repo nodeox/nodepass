@@ -52,9 +52,17 @@ func ValidateConfig(c *common.Config) error {
 	}
 
 	// 验证入站配置
+	listenAddrs := make(map[string]struct{})
 	for i, in := range c.Inbounds {
 		if in.Protocol == "" {
 			return fmt.Errorf("inbounds[%d].protocol is required", i)
+		}
+		// 协议白名单
+		switch in.Protocol {
+		case "tcp", "tls", "ws", "quic", "np-chain", "forward":
+			// OK
+		default:
+			return fmt.Errorf("inbounds[%d].protocol invalid: %s (must be tcp, tls, ws, quic, np-chain, or forward)", i, in.Protocol)
 		}
 		if in.Listen == "" {
 			return fmt.Errorf("inbounds[%d].listen is required", i)
@@ -63,9 +71,27 @@ func ValidateConfig(c *common.Config) error {
 		if _, _, err := net.SplitHostPort(in.Listen); err != nil {
 			return fmt.Errorf("inbounds[%d].listen invalid: %w", i, err)
 		}
+		// 重复 listen 地址检测
+		if _, dup := listenAddrs[in.Listen]; dup {
+			return fmt.Errorf("inbounds[%d].listen duplicate: %s", i, in.Listen)
+		}
+		listenAddrs[in.Listen] = struct{}{}
+		// tls/quic 必须配 cert+key
+		if in.Protocol == "tls" || in.Protocol == "quic" {
+			if in.TLS.Cert == "" || in.TLS.Key == "" {
+				return fmt.Errorf("inbounds[%d] (%s) requires tls.cert and tls.key", i, in.Protocol)
+			}
+		}
+		// forward 必须配 target
+		if in.Protocol == "forward" {
+			if in.Target == "" {
+				return fmt.Errorf("inbounds[%d] (forward) requires target", i)
+			}
+		}
 	}
 
 	// 验证出站配置
+	outboundNames := make(map[string]struct{})
 	for i, out := range c.Outbounds {
 		if out.Name == "" {
 			return fmt.Errorf("outbounds[%d].name is required", i)
@@ -73,6 +99,28 @@ func ValidateConfig(c *common.Config) error {
 		if out.Protocol == "" {
 			return fmt.Errorf("outbounds[%d].protocol is required", i)
 		}
+		// 协议白名单
+		switch out.Protocol {
+		case "direct", "np-chain":
+			// OK
+		default:
+			return fmt.Errorf("outbounds[%d].protocol invalid: %s (must be direct or np-chain)", i, out.Protocol)
+		}
+		// np-chain 必须配 address
+		if out.Protocol == "np-chain" {
+			if out.Address == "" {
+				return fmt.Errorf("outbounds[%d] (np-chain) requires address", i)
+			}
+			// np-chain outbound 不支持 quic transport
+			if out.Transport == "quic" {
+				return fmt.Errorf("outbounds[%d] (np-chain) does not support transport=quic", i)
+			}
+		}
+		// 重复 name 检测
+		if _, dup := outboundNames[out.Name]; dup {
+			return fmt.Errorf("outbounds[%d].name duplicate: %s", i, out.Name)
+		}
+		outboundNames[out.Name] = struct{}{}
 	}
 
 	// 检测 TCP-over-TCP

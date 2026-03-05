@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"net"
 	"sync"
+	"time"
 
 	"github.com/nodeox/nodepass/internal/common"
 	"github.com/nodeox/nodepass/internal/observability"
@@ -19,6 +20,7 @@ type NPChainInbound struct {
 
 	listener net.Listener
 	router   common.Router
+	tracker  *connTracker
 	ready    chan struct{}
 
 	ctx    context.Context
@@ -29,9 +31,10 @@ type NPChainInbound struct {
 // NewNPChain 创建 NP-Chain 入站
 func NewNPChain(cfg common.InboundConfig, logger *zap.Logger) (*NPChainInbound, error) {
 	return &NPChainInbound{
-		listen: cfg.Listen,
-		logger: logger.With(zap.String("inbound", "np-chain")),
-		ready:  make(chan struct{}),
+		listen:  cfg.Listen,
+		logger:  logger.With(zap.String("inbound", "np-chain")),
+		tracker: newConnTracker(),
+		ready:   make(chan struct{}),
 	}, nil
 }
 
@@ -67,7 +70,7 @@ func (n *NPChainInbound) Start(ctx context.Context, router common.Router) error 
 		n.wg.Add(1)
 		go func() {
 			defer n.wg.Done()
-			handleNPChainStream(n.ctx, conn, n.router, n.logger)
+			handleNPChainStream(n.ctx, conn, n.router, n.logger, n.tracker)
 		}()
 	}
 }
@@ -80,7 +83,17 @@ func (n *NPChainInbound) Stop() error {
 	if n.listener != nil {
 		n.listener.Close()
 	}
-	n.wg.Wait()
+	n.tracker.CloseAll()
+	done := make(chan struct{})
+	go func() {
+		n.wg.Wait()
+		close(done)
+	}()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		n.logger.Warn("np-chain inbound stop timed out after 10s")
+	}
 	n.logger.Info("np-chain inbound stopped", zap.String("listen", n.listen))
 	return nil
 }
