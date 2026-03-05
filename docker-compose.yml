@@ -1,0 +1,42 @@
+services:
+  controller:
+    build: .
+    command: ["--config", "/etc/nodepass/config.yaml"]
+    ports:
+      - "8443:8443"
+      - "9090:9090"
+    volumes:
+      - ./configs/controller.yaml:/etc/nodepass/config.yaml:ro
+
+  ingress:
+    build: .
+    command: ["--config", "/etc/nodepass/config.yaml"]
+    ports:
+      - "9000:9000"
+      - "9091:9090"
+    volumes:
+      - ./configs/ingress.yaml:/etc/nodepass/config.yaml:ro
+    depends_on:
+      - controller
+      - relay
+
+  relay:
+    build: .
+    command: ["--config", "/etc/nodepass/config.yaml"]
+    ports:
+      - "9092:9090"
+    volumes:
+      - ./configs/relay.yaml:/etc/nodepass/config.yaml:ro
+    depends_on:
+      - controller
+      - egress
+
+  egress:
+    build: .
+    command: ["--config", "/etc/nodepass/config.yaml"]
+    ports:
+      - "9093:9090"
+    volumes:
+      - ./configs/egress.yaml:/etc/nodepass/config.yaml:ro
+    depends_on:
+      - controller

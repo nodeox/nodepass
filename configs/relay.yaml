@@ -1,0 +1,38 @@
+version: "2.0"
+
+node:
+  id: "relay-1"
+  type: "relay"
+  tags:
+    region: "eu-central"
+
+controller:
+  enabled: true
+  address: "http://controller:8443"
+
+inbounds:
+  - protocol: "np-chain"
+    listen: "0.0.0.0:9100"
+
+outbounds:
+  - name: "egress-1"
+    protocol: "np-chain"
+    group: "egress"
+    address: "egress:9100"
+    transport: "tcp"
+  - name: "direct"
+    protocol: "direct"
+
+routing:
+  rules:
+    - type: "default"
+      outbound_group: "egress"
+      strategy: "least-load"
+
+observability:
+  metrics:
+    enabled: true
+    listen: "0.0.0.0:9090"
+  logging:
+    level: "info"
+    format: "json"

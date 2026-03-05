@@ -1,0 +1,36 @@
+version: "2.0"
+
+node:
+  id: "ingress-1"
+  type: "ingress"
+  tags:
+    region: "us-west"
+
+controller:
+  enabled: true
+  address: "http://controller:8443"
+
+inbounds:
+  - protocol: "tcp"
+    listen: "0.0.0.0:9000"
+
+outbounds:
+  - name: "relay-1"
+    protocol: "np-chain"
+    group: "relay"
+    address: "relay:9100"
+    transport: "tcp"
+
+routing:
+  rules:
+    - type: "default"
+      outbound_group: "relay"
+      strategy: "round-robin"
+
+observability:
+  metrics:
+    enabled: true
+    listen: "0.0.0.0:9090"
+  logging:
+    level: "info"
+    format: "json"

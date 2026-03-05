@@ -1,0 +1,60 @@
+version: "2.0"
+
+node:
+  id: "ingress-1"
+  type: "ingress"
+  tags:
+    region: "us-west"
+    env: "production"
+
+controller:
+  enabled: false
+  address: "controller.example.com:8443"
+  tls:
+    cert: "/etc/nodepass/certs/node.crt"
+    key: "/etc/nodepass/certs/node.key"
+    ca: "/etc/nodepass/certs/ca.crt"
+
+inbounds:
+  - protocol: "socks5"
+    listen: "0.0.0.0:1080"
+    auth:
+      enabled: false
+      users:
+        - username: "user1"
+          password: "pass1"
+
+outbounds:
+  - name: "direct"
+    protocol: "direct"
+    group: "default"
+
+routing:
+  rules:
+    - type: "default"
+      outbound: "direct"
+
+aggregation:
+  enabled: false
+  connections: 3
+  chunk_size: 65536
+
+observability:
+  tracing:
+    enabled: false
+    endpoint: "otel-collector:4317"
+    sample_rate: 0.1
+
+  metrics:
+    enabled: true
+    listen: "0.0.0.0:9090"
+
+  logging:
+    level: "info"
+    format: "json"
+    output: "stdout"
+
+limits:
+  max_sessions: 10000
+  max_bandwidth_mbps: 1000
+  per_user_bandwidth_mbps: 100
