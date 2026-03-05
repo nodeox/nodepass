@@ -22,9 +22,11 @@ type TLSInbound struct {
 	router    common.Router
 	tracker   *connTracker
 	ready     chan struct{}
+	readyOnce sync.Once
 	ctx       context.Context
 	cancel    context.CancelFunc
 	wg        sync.WaitGroup
+	mu        sync.Mutex // Protects listener access during Start/Stop race
 }
 
 // NewTLS 创建 TLS 入站
@@ -53,27 +55,44 @@ func NewTLS(cfg common.InboundConfig, logger *zap.Logger) (*TLSInbound, error) {
 }
 
 func (t *TLSInbound) Start(ctx context.Context, router common.Router) error {
-	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.router = router
+
+	// Ensure cleanup on early return
+	var started bool
+	defer func() {
+		if !started {
+			t.readyOnce.Do(func() { close(t.ready) })
+		}
+	}()
 
 	ln, err := tls.Listen("tcp", t.listen, t.tlsConfig)
 	if err != nil {
 		return fmt.Errorf("tls listen failed: %w", err)
 	}
+
+	// CRITICAL: Set both cancel and listener atomically under lock
+	t.mu.Lock()
+	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.listener = ln
+	t.mu.Unlock()
+
 	t.logger.Info("tls inbound started", zap.String("listen", ln.Addr().String()))
-	close(t.ready)
+	t.readyOnce.Do(func() { close(t.ready) })
+	started = true
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-t.ctx.Done():
+			// Check context under lock
+			t.mu.Lock()
+			ctxDone := t.ctx != nil && t.ctx.Err() != nil
+			t.mu.Unlock()
+
+			if ctxDone {
 				return nil
-			default:
-				t.logger.Error("accept failed", zap.Error(err))
-				continue
 			}
+			t.logger.Error("accept failed", zap.Error(err))
+			continue
 		}
 
 		observability.InboundConnectionsTotal.WithLabelValues("tls", t.listen).Inc()
@@ -81,18 +100,28 @@ func (t *TLSInbound) Start(ctx context.Context, router common.Router) error {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			handleNPChainStream(t.ctx, conn, t.router, t.logger, t.tracker)
+			// Read ctx under lock
+			t.mu.Lock()
+			ctx := t.ctx
+			t.mu.Unlock()
+			handleNPChainStream(ctx, conn, t.router, t.logger, t.tracker)
 		}()
 	}
 }
 
 func (t *TLSInbound) Stop() error {
+	t.readyOnce.Do(func() { close(t.ready) })
+
+	// Cancel context and close listener atomically under lock
+	t.mu.Lock()
 	if t.cancel != nil {
 		t.cancel()
 	}
 	if t.listener != nil {
 		t.listener.Close()
 	}
+	t.mu.Unlock()
+
 	t.tracker.CloseAll()
 	done := make(chan struct{})
 	go func() {
@@ -101,11 +130,12 @@ func (t *TLSInbound) Stop() error {
 	}()
 	select {
 	case <-done:
+		t.logger.Info("tls inbound stopped")
+		return nil
 	case <-time.After(10 * time.Second):
 		t.logger.Warn("tls inbound stop timed out after 10s")
+		return fmt.Errorf("tls inbound stop timed out: goroutines still running after 10s")
 	}
-	t.logger.Info("tls inbound stopped")
-	return nil
 }
 
 func (t *TLSInbound) Addr() net.Addr {

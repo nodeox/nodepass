@@ -2,9 +2,11 @@ package agent
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"runtime"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -16,6 +18,41 @@ import (
 	"github.com/nodeox/nodepass/internal/routing"
 	"go.uber.org/zap"
 )
+
+// PartialReloadError indicates that ReloadConfig partially succeeded:
+// some changes were applied and a reconciled config matching the actual
+// running state has been stored internally. Callers should NOT retry
+// the same config change, as that would attempt to re-apply already
+// completed operations.
+type PartialReloadError struct {
+	Err error
+}
+
+func (e *PartialReloadError) Error() string {
+	return fmt.Sprintf("partial reload: %v", e.Err)
+}
+
+func (e *PartialReloadError) Unwrap() error {
+	return e.Err
+}
+
+// RollbackIncompleteError indicates that a rollback after a failed operation
+// did not fully succeed. Some resources (listeners, connections) may still be
+// running in the background but are no longer tracked by the Agent.
+type RollbackIncompleteError struct {
+	// Cause is the original error that triggered the rollback.
+	Cause error
+	// RollbackErrors lists the resources that failed to stop.
+	RollbackErrors []string
+}
+
+func (e *RollbackIncompleteError) Error() string {
+	return fmt.Sprintf("%v; rollback incomplete: %s", e.Cause, strings.Join(e.RollbackErrors, "; "))
+}
+
+func (e *RollbackIncompleteError) Unwrap() error {
+	return e.Cause
+}
 
 // Agent 核心引擎
 type Agent struct {
@@ -39,6 +76,7 @@ type Agent struct {
 	configPath         string
 	configPollInterval time.Duration
 	lastConfigModTime  time.Time
+	reloadMu           sync.Mutex // serializes ReloadConfig calls
 
 	mu sync.RWMutex
 }
@@ -64,7 +102,7 @@ func New(cfg *common.Config, logger *zap.Logger) (*Agent, error) {
 		router:    routing.NewRouter(logger),
 	}
 
-	a.config.Store(cfg)
+	a.config.Store(cfg.DeepCopy())
 
 	return a, nil
 }
@@ -140,10 +178,11 @@ func (a *Agent) Stop() error {
 	a.logger.Info("stopping agent")
 	observability.AgentStateGauge.Set(float64(StateStopping))
 
-	// 取消上下文
+	// 取消上下文（通知所有协程退出）
 	a.cancel()
 
 	// 停止所有入站（停止接收新连接）
+	var stopErrors []error
 	a.mu.Lock()
 	for name, ib := range a.inbounds {
 		a.logger.Info("stopping inbound", zap.String("name", name))
@@ -152,11 +191,13 @@ func (a *Agent) Stop() error {
 				zap.String("name", name),
 				zap.Error(err),
 			)
+			stopErrors = append(stopErrors, fmt.Errorf("inbound %s: %w", name, err))
 		}
 	}
 	a.mu.Unlock()
 
-	// 等待所有协程结束
+	// 等待所有协程结束（包括 configWatchLoop）
+	// 注意：不持有 reloadMu，避免与 configWatchLoop 中的 ReloadConfig() 死锁
 	a.logger.Info("waiting for goroutines to finish")
 	a.wg.Wait()
 
@@ -164,6 +205,10 @@ func (a *Agent) Stop() error {
 	observability.AgentStateGauge.Set(float64(StateStopped))
 
 	a.logger.Info("agent stopped")
+
+	if len(stopErrors) > 0 {
+		return fmt.Errorf("agent stopped with %d error(s): %v", len(stopErrors), stopErrors)
+	}
 
 	return nil
 }
@@ -243,8 +288,17 @@ func (a *Agent) collectMetrics() {
 	)
 }
 
-// ReloadConfig 重新加载配置
+// ReloadConfig 重新加载配置。
+// 串行化执行：同一时刻只有一个 reload 操作在运行，且与 Stop() 互斥。
 func (a *Agent) ReloadConfig(newCfg *common.Config) error {
+	a.reloadMu.Lock()
+	defer a.reloadMu.Unlock()
+
+	// 检查 agent 是否仍在运行（Stop 可能已完成或正在进行）
+	if a.state.Load() != StateRunning {
+		return fmt.Errorf("agent not running, cannot reload config")
+	}
+
 	if err := ValidateConfig(newCfg); err != nil {
 		observability.ConfigReloadErrorsTotal.Inc()
 		return fmt.Errorf("invalid config: %w", err)
@@ -271,9 +325,13 @@ func (a *Agent) ReloadConfig(newCfg *common.Config) error {
 		return fmt.Errorf("failed to prepare config: %w", err)
 	}
 
-	// Commit 阶段：原子替换配置并应用变更
-	a.config.Store(newCfg)
-	a.commitDiff(prep)
+	// Commit 阶段：停旧启新，完成后再替换配置
+	if err := a.commitDiff(prep, oldCfg, newCfg); err != nil {
+		observability.ConfigReloadErrorsTotal.Inc()
+		return fmt.Errorf("failed to commit config: %w", err)
+	}
+
+	a.config.Store(newCfg.DeepCopy())
 
 	observability.ConfigReloadTotal.Inc()
 	a.logger.Info("config reloaded successfully")
@@ -373,12 +431,153 @@ func (a *Agent) prepareDiff(diff *ConfigDiff, cfg *common.Config) (*prepareResul
 }
 
 // commitDiff applies prepared changes to the running state.
-// This phase only does stop-old/register-new/start-new, which should not fail.
-func (a *Agent) commitDiff(prep *prepareResult) {
+// For new inbounds (not replacing existing ones): starts first, confirms ready, then registers.
+// For updated inbounds (replacing existing ones): must stop old first (to free the port),
+// then start new. If old Stop() fails, the update is skipped to preserve the management handle.
+// On partial update failure, a reconciled config matching actual running state is stored.
+// Removed inbounds and outbound changes are applied atomically under lock.
+func (a *Agent) commitDiff(prep *prepareResult, oldCfg, newCfg *common.Config) error {
+	// Separate new inbounds into "added" (no existing handler) vs "updated" (replacing existing).
+	a.mu.RLock()
+	addedInbounds := make(map[string]common.InboundHandler)
+	updatedInbounds := make(map[string]common.InboundHandler)
+	for listen, newIb := range prep.newInbounds {
+		if _, exists := a.inbounds[listen]; exists {
+			updatedInbounds[listen] = newIb
+		} else {
+			addedInbounds[listen] = newIb
+		}
+	}
+	a.mu.RUnlock()
+
+	// Phase 1: Start all "added" inbounds (no port conflict) and wait for Ready.
+	// If any fails, stop all of them and return error — no running state was changed.
+	if len(addedInbounds) > 0 {
+		if err := a.startAndWaitInbounds(addedInbounds); err != nil {
+			// If rollback failed (RollbackIncompleteError), resources are leaked.
+			// Wrap in PartialReloadError to signal configWatchLoop to advance lastConfigModTime.
+			var rbErr *RollbackIncompleteError
+			if errors.As(err, &rbErr) {
+				return &PartialReloadError{Err: err}
+			}
+			return err
+		}
+	}
+
+	// Phase 2: Handle updated inbounds FIRST (before any removes/adds).
+	// Track which updates succeeded vs failed for config reconciliation.
+	var updateErrors []string
+	successfulUpdates := make(map[string]bool) // listen → true if update succeeded
+	failedAndRemoved := make(map[string]bool)  // listen → true if handler was removed from map
+	if len(updatedInbounds) > 0 {
+		a.mu.Lock()
+		for listen, newIb := range updatedInbounds {
+			if oldIb, ok := a.inbounds[listen]; ok {
+				a.logger.Info("updating inbound", zap.String("listen", listen))
+				if err := oldIb.Stop(); err != nil {
+					// 旧 Stop 失败 → 保留旧 handler，跳过本次更新
+					a.logger.Error("failed to stop old inbound, keeping existing",
+						zap.String("listen", listen),
+						zap.Error(err),
+					)
+					newIb.Stop() // 清理未使用的新 handler
+					updateErrors = append(updateErrors, fmt.Sprintf("inbound %s: old stop failed: %v", listen, err))
+					continue
+				}
+			}
+
+			// Start the new inbound and wait for Ready
+			a.wg.Add(1)
+			startErr := make(chan error, 1)
+			go func(handler common.InboundHandler, addr string) {
+				defer a.wg.Done()
+				err := handler.Start(a.ctx, a.router)
+				if err != nil {
+					startErr <- err
+				}
+			}(newIb, listen)
+
+			// Wait for Ready or Start failure (release lock during wait)
+			a.mu.Unlock()
+			readyCh := make(chan struct{})
+			go func() {
+				newIb.WaitReady()
+				close(readyCh)
+			}()
+
+			var bindErr error
+			select {
+			case <-readyCh:
+				// OK
+			case err := <-startErr:
+				bindErr = err
+			case <-a.ctx.Done():
+				// Agent is stopping, treat as failure
+				bindErr = fmt.Errorf("agent stopping during inbound update")
+			}
+			a.mu.Lock()
+
+			if bindErr != nil {
+				a.logger.Error("updated inbound failed to start",
+					zap.String("listen", listen),
+					zap.Error(bindErr),
+				)
+				// Stop newIb to release WaitReady goroutine (Stop closes ready via readyOnce)
+				newIb.Stop()
+				// Old is already stopped, new failed — remove from map
+				delete(a.inbounds, listen)
+				failedAndRemoved[listen] = true
+				updateErrors = append(updateErrors, fmt.Sprintf("inbound %s: %v", listen, bindErr))
+				continue
+			}
+
+			a.inbounds[listen] = newIb
+			successfulUpdates[listen] = true
+		}
+		a.mu.Unlock()
+	}
+
+	// If any updated inbound failed, roll back Phase 1 added inbounds and return error.
+	if len(updateErrors) > 0 {
+		var rollbackErrors []string
+		for listen, ib := range addedInbounds {
+			if err := ib.Stop(); err != nil {
+				a.logger.Error("failed to stop added inbound during rollback",
+					zap.String("listen", listen),
+					zap.Error(err),
+				)
+				rollbackErrors = append(rollbackErrors, fmt.Sprintf("%s: %v", listen, err))
+			}
+		}
+
+		cause := fmt.Errorf("updated inbound(s) failed: %s", strings.Join(updateErrors, "; "))
+
+		// Wrap with RollbackIncompleteError if any rollback Stop() failed
+		var underlying error
+		if len(rollbackErrors) > 0 {
+			underlying = &RollbackIncompleteError{Cause: cause, RollbackErrors: rollbackErrors}
+		} else {
+			underlying = cause
+		}
+
+		// Distinguish: did any state actually change?
+		// - successfulUpdates: old stopped + new running (config changed)
+		// - failedAndRemoved: old stopped + new failed (handler lost from map)
+		// - rollbackErrors: added inbounds failed to stop (resources leaked)
+		// If neither state change nor rollback failure, all failures were "old Stop failed"
+		// → old handlers still running, no state change → return regular error so configWatchLoop will retry.
+		if len(successfulUpdates) > 0 || len(failedAndRemoved) > 0 || len(rollbackErrors) > 0 {
+			a.storeReconciledConfig(oldCfg, newCfg, successfulUpdates, failedAndRemoved)
+			return &PartialReloadError{Err: underlying}
+		}
+		return underlying
+	}
+
+	// Phase 3: Apply remaining changes under lock (removes, adds, outbounds, routing).
 	a.mu.Lock()
 	defer a.mu.Unlock()
 
-	// 1. Stop and remove old inbounds (removed + updated)
+	// 3a. Stop and remove deleted inbounds
 	for _, listen := range prep.removeInbounds {
 		if ib, ok := a.inbounds[listen]; ok {
 			a.logger.Info("removing inbound", zap.String("listen", listen))
@@ -392,39 +591,12 @@ func (a *Agent) commitDiff(prep *prepareResult) {
 		}
 	}
 
-	// Stop old inbounds that are being updated (they have replacements in newInbounds)
-	for listen := range prep.newInbounds {
-		if oldIb, ok := a.inbounds[listen]; ok {
-			a.logger.Info("updating inbound", zap.String("listen", listen))
-			if err := oldIb.Stop(); err != nil {
-				a.logger.Error("failed to stop old inbound",
-					zap.String("listen", listen),
-					zap.Error(err),
-				)
-			}
-			delete(a.inbounds, listen)
-		}
-	}
-
-	// 2. Register and start new inbounds
-	for listen, newIb := range prep.newInbounds {
-		a.logger.Info("starting inbound", zap.String("listen", listen))
+	// 3b. Register added inbounds (already confirmed running from Phase 1)
+	for listen, newIb := range addedInbounds {
 		a.inbounds[listen] = newIb
-		a.wg.Add(1)
-		go func(handler common.InboundHandler, addr string) {
-			defer a.wg.Done()
-			if err := handler.Start(a.ctx, a.router); err != nil {
-				if a.ctx.Err() == nil {
-					a.logger.Error("inbound exited with error",
-						zap.String("listen", addr),
-						zap.Error(err),
-					)
-				}
-			}
-		}(newIb, listen)
 	}
 
-	// 3. Remove old outbounds
+	// 3c. Remove old outbounds
 	for _, name := range prep.removeOutbounds {
 		a.logger.Info("removing outbound", zap.String("name", name))
 		a.router.RemoveOutbound(name)
@@ -440,17 +612,131 @@ func (a *Agent) commitDiff(prep *prepareResult) {
 		}
 	}
 
-	// 4. Register new outbounds
+	// 3d. Register new outbounds
 	for name, newOut := range prep.newOutbounds {
 		a.logger.Info("adding outbound", zap.String("name", name))
 		a.outbounds[name] = newOut
 		a.router.AddOutbound(newOut)
 	}
 
-	// 5. Update routing rules if changed
+	// 3e. Update routing rules if changed
 	if prep.routingChanged {
 		a.logger.Info("updating routing rules")
 		a.router.UpdateRules(prep.routingRules)
+	}
+
+	return nil
+}
+
+// storeReconciledConfig 在 updated inbound 部分失败后，构建并存储与运行态一致的配置。
+// 成功更新的 inbound 使用 newCfg 的配置，未变更的保留 oldCfg 配置，
+// 失败且已从 map 中移除的 inbound 不出现在配置中。
+// Outbound 和 Routing 未变更，沿用 oldCfg。
+func (a *Agent) storeReconciledConfig(oldCfg, newCfg *common.Config, successfulUpdates, failedAndRemoved map[string]bool) {
+	reconciled := oldCfg.DeepCopy()
+
+	// 构建 newCfg 的 inbound 索引
+	newInboundMap := make(map[string]common.InboundConfig)
+	for _, in := range newCfg.Inbounds {
+		newInboundMap[in.Listen] = in
+	}
+
+	var inbounds []common.InboundConfig
+	for _, in := range oldCfg.Inbounds {
+		if failedAndRemoved[in.Listen] {
+			// handler 已从 map 中移除（旧停成功、新启动失败），跳过
+			continue
+		}
+		if successfulUpdates[in.Listen] {
+			// 更新成功，使用新配置
+			if newIn, ok := newInboundMap[in.Listen]; ok {
+				inbounds = append(inbounds, newIn)
+			}
+		} else {
+			// 未变更或更新被跳过（旧 Stop 失败），保留旧配置
+			inbounds = append(inbounds, in)
+		}
+	}
+	reconciled.Inbounds = inbounds
+
+	a.config.Store(reconciled)
+	a.logger.Warn("stored reconciled config after partial update failure",
+		zap.Int("successful_updates", len(successfulUpdates)),
+		zap.Int("failed_and_removed", len(failedAndRemoved)),
+	)
+}
+
+// startAndWaitInbounds starts the given inbound handlers and waits for all
+// to bind successfully (WaitReady). If any fails, all are stopped and error returned.
+func (a *Agent) startAndWaitInbounds(inbounds map[string]common.InboundHandler) error {
+	type startResult struct {
+		listen string
+		err    error
+	}
+	startErrors := make(chan startResult, len(inbounds))
+	readyWg := sync.WaitGroup{}
+
+	for listen, newIb := range inbounds {
+		readyWg.Add(1)
+		a.wg.Add(1)
+		go func(handler common.InboundHandler, addr string) {
+			defer a.wg.Done()
+			errCh := make(chan error, 1)
+			go func() {
+				errCh <- handler.Start(a.ctx, a.router)
+			}()
+
+			readyCh := make(chan struct{})
+			go func() {
+				handler.WaitReady()
+				close(readyCh)
+			}()
+
+			select {
+			case <-readyCh:
+				readyWg.Done()
+				// Wait for Start to finish (accept loop exit)
+				err := <-errCh
+				if err != nil && a.ctx.Err() == nil {
+					a.logger.Error("inbound exited with error",
+						zap.String("listen", addr),
+						zap.Error(err),
+					)
+				}
+			case err := <-errCh:
+				if err != nil {
+					startErrors <- startResult{listen: addr, err: err}
+				}
+				readyWg.Done()
+			}
+		}(newIb, listen)
+	}
+
+	readyWg.Wait()
+
+	select {
+	case res := <-startErrors:
+		a.logger.Error("new inbound startup failed, rolling back",
+			zap.String("listen", res.listen),
+			zap.Error(res.err),
+		)
+		var rollbackErrors []string
+		for listen, ib := range inbounds {
+			if err := ib.Stop(); err != nil {
+				a.logger.Error("failed to stop inbound during rollback",
+					zap.String("listen", listen),
+					zap.Error(err),
+				)
+				rollbackErrors = append(rollbackErrors, fmt.Sprintf("%s: %v", listen, err))
+			}
+		}
+		cause := fmt.Errorf("inbound %s failed to start: %w", res.listen, res.err)
+		if len(rollbackErrors) > 0 {
+			return &RollbackIncompleteError{Cause: cause, RollbackErrors: rollbackErrors}
+		}
+		return cause
+	default:
+		return nil
 	}
 }
 
@@ -509,14 +795,13 @@ func (a *Agent) configWatchLoop() {
 					zap.String("path", a.configPath),
 				)
 
-				a.lastConfigModTime = modTime
-
 				newCfg, err := LoadConfig(a.configPath)
 				if err != nil {
 					a.logger.Error("failed to load config",
 						zap.String("path", a.configPath),
 						zap.Error(err),
 					)
+					// 不推进 lastConfigModTime，下次轮询会重试
 					continue
 				}
 
@@ -524,7 +809,18 @@ func (a *Agent) configWatchLoop() {
 					a.logger.Error("failed to reload config",
 						zap.Error(err),
 					)
+					// Partial reload: some changes were applied and reconciled config stored.
+					// Advance lastConfigModTime to avoid retrying the same partial-success operation.
+					var partialErr *PartialReloadError
+					if errors.As(err, &partialErr) {
+						a.lastConfigModTime = modTime
+					}
+					// 不推进 lastConfigModTime，下次轮询会重试
+					continue
 				}
+
+				// 只有完全成功才推进 lastConfigModTime
+				a.lastConfigModTime = modTime
 			}
 
 		case <-a.ctx.Done():
@@ -535,38 +831,35 @@ func (a *Agent) configWatchLoop() {
 }
 
 // initInbounds 初始化入站处理器
+// 创建所有入站 handler，启动并等待所有 listener 绑定成功后才返回。
+// 如果任何 listener 绑定失败，所有已启动的入站将被停止并返回错误。
 func (a *Agent) initInbounds(cfg *common.Config) error {
-	a.mu.Lock()
-	defer a.mu.Unlock()
-
+	// Phase 1: Create all inbound handlers
+	handlers := make(map[string]common.InboundHandler)
 	for _, inCfg := range cfg.Inbounds {
 		ib, err := inbound.New(inCfg, a.logger)
 		if err != nil {
 			return fmt.Errorf("failed to create inbound %s: %w", inCfg.Listen, err)
 		}
-
-		a.inbounds[inCfg.Listen] = ib
+		handlers[inCfg.Listen] = ib
 
 		a.logger.Info("inbound initialized",
 			zap.String("listen", inCfg.Listen),
 			zap.String("protocol", inCfg.Protocol),
 		)
-
-		// 每个入站在独立 goroutine 中运行（Start 是阻塞的 accept 循环）
-		a.wg.Add(1)
-		go func(handler common.InboundHandler, listen string) {
-			defer a.wg.Done()
-			if err := handler.Start(a.ctx, a.router); err != nil {
-				// ctx 取消导致的错误属于正常关闭
-				if a.ctx.Err() == nil {
-					a.logger.Error("inbound exited with error",
-						zap.String("listen", listen),
-						zap.Error(err),
-					)
-				}
-			}
-		}(ib, inCfg.Listen)
 	}
+
+	// Phase 2: Start all inbounds and wait for bind success
+	if err := a.startAndWaitInbounds(handlers); err != nil {
+		return err
+	}
+
+	// Phase 3: Register under lock
+	a.mu.Lock()
+	for listen, ib := range handlers {
+		a.inbounds[listen] = ib
+	}
+	a.mu.Unlock()
 
 	return nil
 }
@@ -587,9 +880,9 @@ func (a *Agent) GetStateName() string {
 	}
 }
 
-// GetConfig 获取当前配置
+// GetConfig 获取当前配置（返回深拷贝，外部修改不影响内部状态）
 func (a *Agent) GetConfig() *common.Config {
-	return a.config.Load().(*common.Config)
+	return a.config.Load().(*common.Config).DeepCopy()
 }
 
 // GetStats 获取统计信息

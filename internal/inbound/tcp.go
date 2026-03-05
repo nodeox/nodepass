@@ -137,15 +137,17 @@ func biRelay(client, target net.Conn) {
 
 // TCPInbound TCP 传输层入站
 type TCPInbound struct {
-	listen   string
-	logger   *zap.Logger
-	listener net.Listener
-	router   common.Router
-	tracker  *connTracker
-	ready    chan struct{}
-	ctx      context.Context
-	cancel   context.CancelFunc
-	wg       sync.WaitGroup
+	listen    string
+	logger    *zap.Logger
+	listener  net.Listener
+	router    common.Router
+	tracker   *connTracker
+	ready     chan struct{}
+	readyOnce sync.Once
+	ctx       context.Context
+	cancel    context.CancelFunc
+	wg        sync.WaitGroup
+	mu        sync.Mutex // Protects listener access during Start/Stop race
 }
 
 // NewTCP 创建 TCP 入站
@@ -159,27 +161,46 @@ func NewTCP(cfg common.InboundConfig, logger *zap.Logger) (*TCPInbound, error) {
 }
 
 func (t *TCPInbound) Start(ctx context.Context, router common.Router) error {
-	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.router = router
+
+	// Ensure cleanup on early return
+	var started bool
+	defer func() {
+		if !started {
+			// If we return early due to error, ensure ready is closed
+			t.readyOnce.Do(func() { close(t.ready) })
+		}
+	}()
 
 	ln, err := net.Listen("tcp", t.listen)
 	if err != nil {
 		return fmt.Errorf("tcp listen failed: %w", err)
 	}
+
+	// CRITICAL: Set both cancel and listener atomically under lock
+	// This prevents Stop() from missing the listener if called between Listen() and assignment
+	t.mu.Lock()
+	t.ctx, t.cancel = context.WithCancel(ctx)
 	t.listener = ln
+	t.mu.Unlock()
+
 	t.logger.Info("tcp inbound started", zap.String("listen", ln.Addr().String()))
-	close(t.ready)
+	t.readyOnce.Do(func() { close(t.ready) })
+	started = true
 
 	for {
 		conn, err := ln.Accept()
 		if err != nil {
-			select {
-			case <-t.ctx.Done():
+			// Check context under lock to avoid race
+			t.mu.Lock()
+			ctxDone := t.ctx != nil && t.ctx.Err() != nil
+			t.mu.Unlock()
+
+			if ctxDone {
 				return nil
-			default:
-				t.logger.Error("accept failed", zap.Error(err))
-				continue
 			}
+			t.logger.Error("accept failed", zap.Error(err))
+			continue
 		}
 
 		observability.InboundConnectionsTotal.WithLabelValues("tcp", t.listen).Inc()
@@ -187,18 +208,28 @@ func (t *TCPInbound) Start(ctx context.Context, router common.Router) error {
 		t.wg.Add(1)
 		go func() {
 			defer t.wg.Done()
-			handleNPChainStream(t.ctx, conn, t.router, t.logger, t.tracker)
+			// Read ctx under lock
+			t.mu.Lock()
+			ctx := t.ctx
+			t.mu.Unlock()
+			handleNPChainStream(ctx, conn, t.router, t.logger, t.tracker)
 		}()
 	}
 }
 
 func (t *TCPInbound) Stop() error {
+	t.readyOnce.Do(func() { close(t.ready) })
+
+	// Cancel context and close listener atomically under lock
+	t.mu.Lock()
 	if t.cancel != nil {
 		t.cancel()
 	}
 	if t.listener != nil {
 		t.listener.Close()
 	}
+	t.mu.Unlock()
+
 	t.tracker.CloseAll()
 	done := make(chan struct{})
 	go func() {
@@ -207,11 +238,12 @@ func (t *TCPInbound) Stop() error {
 	}()
 	select {
 	case <-done:
+		t.logger.Info("tcp inbound stopped")
+		return nil
 	case <-time.After(10 * time.Second):
 		t.logger.Warn("tcp inbound stop timed out after 10s")
+		return fmt.Errorf("tcp inbound stop timed out: goroutines still running after 10s")
 	}
-	t.logger.Info("tcp inbound stopped")
-	return nil
 }
 
 func (t *TCPInbound) Addr() net.Addr {
