@@ -31,6 +31,10 @@ func LoadConfig(path string) (*common.Config, error) {
 
 // ValidateConfig 验证配置
 func ValidateConfig(c *common.Config) error {
+	if c == nil {
+		return fmt.Errorf("config is nil")
+	}
+
 	if c.Version == "" {
 		return fmt.Errorf("version is required")
 	}
@@ -151,7 +155,9 @@ func detectTCPoverTCP(c *common.Config) error {
 
 	// 检查出站是否有 TCP 传输
 	for _, out := range c.Outbounds {
-		if out.Transport == "tcp" {
+		// 显式 transport=tcp 或 np-chain 协议（默认使用 TCP 传输）
+		isTCP := out.Transport == "tcp" || (out.Protocol == "np-chain" && out.Transport == "")
+		if isTCP {
 			return fmt.Errorf("TCP-over-TCP detected: inbound uses TCP and outbound '%s' uses TCP transport (use QUIC instead)", out.Name)
 		}
 	}
@@ -305,7 +311,35 @@ func DiffConfig(old, new *common.Config) *ConfigDiff {
 func inboundEqual(a, b common.InboundConfig) bool {
 	return a.Protocol == b.Protocol &&
 		a.Listen == b.Listen &&
-		a.Auth.Enabled == b.Auth.Enabled
+		a.Target == b.Target &&
+		tlsEqual(a.TLS, b.TLS) &&
+		authEqual(a.Auth, b.Auth)
+}
+
+// tlsEqual 比较两个 TLS 配置是否相等
+func tlsEqual(a, b common.TLSConfig) bool {
+	return a.Enabled == b.Enabled &&
+		a.Cert == b.Cert &&
+		a.Key == b.Key &&
+		a.CA == b.CA &&
+		a.ServerName == b.ServerName
+}
+
+// authEqual 比较两个认证配置是否相等
+func authEqual(a, b common.AuthConfig) bool {
+	if a.Enabled != b.Enabled {
+		return false
+	}
+	if len(a.Users) != len(b.Users) {
+		return false
+	}
+	for i := range a.Users {
+		if a.Users[i].Username != b.Users[i].Username ||
+			a.Users[i].Password != b.Users[i].Password {
+			return false
+		}
+	}
+	return true
 }
 
 // nodeEqual 比较两个节点配置是否相等
@@ -334,7 +368,8 @@ func outboundEqual(a, b common.OutboundConfig) bool {
 		a.Protocol == b.Protocol &&
 		a.Group == b.Group &&
 		a.Address == b.Address &&
-		a.Transport == b.Transport
+		a.Transport == b.Transport &&
+		tlsEqual(a.TLS, b.TLS)
 }
 
 // routingEqual 比较两个路由配置是否相等

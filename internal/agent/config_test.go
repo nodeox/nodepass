@@ -318,6 +318,40 @@ func TestDetectTCPoverTCP(t *testing.T) {
 			},
 			wantErr: true,
 		},
+		{
+			name: "TCP-over-TCP detected np-chain default transport",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test",
+					Type: "relay",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "np-chain", Listen: "0.0.0.0:1080"},
+				},
+				Outbounds: []common.OutboundConfig{
+					{Name: "out1", Protocol: "np-chain", Address: "1.2.3.4:5678"},
+				},
+			},
+			wantErr: true,
+		},
+		{
+			name: "no TCP-over-TCP quic inbound only",
+			config: &common.Config{
+				Version: "2.0",
+				Node: common.NodeConfig{
+					ID:   "test",
+					Type: "ingress",
+				},
+				Inbounds: []common.InboundConfig{
+					{Protocol: "quic", Listen: "0.0.0.0:1080", TLS: common.TLSConfig{Cert: "cert.pem", Key: "key.pem"}},
+				},
+				Outbounds: []common.OutboundConfig{
+					{Name: "out1", Protocol: "np-chain", Address: "1.2.3.4:5678"},
+				},
+			},
+			wantErr: false,
+		},
 	}
 
 	for _, tt := range tests {
@@ -413,4 +447,78 @@ func TestMergeConfig(t *testing.T) {
 	assert.Equal(t, "ingress", merged.Node.Type)
 	assert.Equal(t, "dev", merged.Node.Tags["env"])
 	assert.Equal(t, "us-west", merged.Node.Tags["region"])
+}
+
+func TestInboundEqual_AllFields(t *testing.T) {
+	base := common.InboundConfig{
+		Protocol: "tls",
+		Listen:   "0.0.0.0:1080",
+		Target:   "127.0.0.1:8080",
+		TLS: common.TLSConfig{
+			Cert: "cert.pem",
+			Key:  "key.pem",
+		},
+		Auth: common.AuthConfig{
+			Enabled: true,
+			Users: []common.UserAuth{
+				{Username: "admin", Password: "pass"},
+			},
+		},
+	}
+
+	// Identical should be equal
+	same := base
+	assert.True(t, inboundEqual(base, same))
+
+	// Changed Target should differ
+	diffTarget := base
+	diffTarget.Target = "127.0.0.1:9090"
+	assert.False(t, inboundEqual(base, diffTarget), "should detect Target change")
+
+	// Changed TLS cert should differ
+	diffTLS := base
+	diffTLS.TLS.Cert = "new-cert.pem"
+	assert.False(t, inboundEqual(base, diffTLS), "should detect TLS change")
+
+	// Changed auth users should differ
+	diffUsers := base
+	diffUsers.Auth.Users = []common.UserAuth{
+		{Username: "admin", Password: "newpass"},
+	}
+	assert.False(t, inboundEqual(base, diffUsers), "should detect Auth.Users change")
+
+	// Added auth user should differ
+	diffUsersLen := base
+	diffUsersLen.Auth.Users = []common.UserAuth{
+		{Username: "admin", Password: "pass"},
+		{Username: "user2", Password: "pass2"},
+	}
+	assert.False(t, inboundEqual(base, diffUsersLen), "should detect Auth.Users length change")
+}
+
+func TestOutboundEqual_TLSField(t *testing.T) {
+	base := common.OutboundConfig{
+		Name:      "out1",
+		Protocol:  "np-chain",
+		Group:     "default",
+		Address:   "1.2.3.4:5678",
+		Transport: "ws",
+		TLS: common.TLSConfig{
+			Enabled:    true,
+			ServerName: "example.com",
+		},
+	}
+
+	same := base
+	assert.True(t, outboundEqual(base, same))
+
+	diffTLS := base
+	diffTLS.TLS.ServerName = "other.com"
+	assert.False(t, outboundEqual(base, diffTLS), "should detect TLS change")
+}
+
+func TestValidateConfig_Nil(t *testing.T) {
+	err := ValidateConfig(nil)
+	assert.Error(t, err)
+	assert.Contains(t, err.Error(), "config is nil")
 }
