@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"io"
 	"sync"
-	"sync/atomic"
 
 	"github.com/google/uuid"
 	"go.uber.org/zap"
@@ -20,13 +19,17 @@ type Reassembler struct {
 
 // SessionBuffer 会话缓冲区
 type SessionBuffer struct {
-	chunks   map[uint32][]byte
-	nextSeq  uint32
-	finSeq   int64 // FIN 分片的 seq，-1 表示未收到
-	output   chan []byte
-	flowCtrl *WindowFlowController
+	chunks  map[uint32][]byte
+	nextSeq uint32
+	finSeq  int64 // FIN 分片的 seq，-1 表示未收到
+	output  chan []byte
+	done    chan struct{} // closed when session is terminated, safe to select on
+	doneOnce sync.Once   // guards closing done
 
-	retrying atomic.Bool
+	outputClosed bool // guards closing output, protected by mu
+	flowCtrl     *WindowFlowController
+
+	retrying bool // true = retry goroutine owns sending; protected by mu
 	mu       sync.Mutex
 }
 
@@ -82,12 +85,20 @@ func (r *Reassembler) Process(data []byte) error {
 		chunks:   make(map[uint32][]byte),
 		finSeq:   -1,
 		output:   make(chan []byte, 100),
+		done:     make(chan struct{}),
 		flowCtrl: NewWindowFlowController(16 * 1024 * 1024), // 16MB
 	})
 	sb := val.(*SessionBuffer)
 
 	// 存储分片
 	sb.mu.Lock()
+	select {
+	case <-sb.done:
+		sb.mu.Unlock()
+		return nil
+	default:
+	}
+
 	sb.chunks[seq] = chunk
 
 	// 记录 FIN 序号
@@ -100,25 +111,36 @@ func (r *Reassembler) Process(data []byte) error {
 	return r.tryReassemble(sb)
 }
 
-// tryReassemble 尝试按序重组分片
+// tryReassemble 尝试按序重组分片。
+// 所有发送操作在锁内以非阻塞方式进行。
+// 当 retrying 为 true 时，retry goroutine 独占发送权，本方法直接返回。
 func (r *Reassembler) tryReassemble(sb *SessionBuffer) error {
 	sb.mu.Lock()
 	defer sb.mu.Unlock()
 
+	select {
+	case <-sb.done:
+		return nil
+	default:
+	}
+
+	// retry goroutine 正在运行，它独占发送权
+	if sb.retrying {
+		return nil
+	}
+
 	for {
-		// 检查背压
 		if sb.flowCtrl.ShouldPause() {
 			r.logger.Debug("flow control paused")
 			break
 		}
 
-		// 查找下一个序号的分片
 		chunk, ok := sb.chunks[sb.nextSeq]
 		if !ok {
-			break // 等待缺失的分片
+			break
 		}
 
-		// 发送到输出通道
+		// 非阻塞发送
 		select {
 		case sb.output <- chunk:
 			sb.flowCtrl.OnBuffered(len(chunk))
@@ -126,17 +148,19 @@ func (r *Reassembler) tryReassemble(sb *SessionBuffer) error {
 			delete(sb.chunks, currentSeq)
 			sb.nextSeq++
 
-			// 如果是 FIN 分片，关闭输出通道
 			if sb.finSeq >= 0 && int64(currentSeq) == sb.finSeq {
-				close(sb.output)
+				if !sb.outputClosed {
+					close(sb.output)
+					sb.outputClosed = true
+				}
+				sb.doneOnce.Do(func() { close(sb.done) })
 				return nil
 			}
 
 		default:
-			// 输出通道满，启动背压恢复 goroutine
-			if sb.retrying.CompareAndSwap(false, true) {
-				go r.retryReassemble(sb)
-			}
+			// channel 满，将发送权交给 retry goroutine
+			sb.retrying = true
+			go r.retryReassemble(sb)
 			return nil
 		}
 	}
@@ -144,41 +168,111 @@ func (r *Reassembler) tryReassemble(sb *SessionBuffer) error {
 	return nil
 }
 
-// retryReassemble 在背压恢复后重试推送缓存的有序分片
+// retryReassemble 独占发送权，处理背压恢复。
+// 当 retrying 为 true 时，tryReassemble 不发送任何东西，
+// 所以本 goroutine 是唯一发送者，不存在并发发送问题。
+// 阻塞发送时不修改 nextSeq，直到发送成功后才更新状态。
+// 退出时负责关闭 output（如果尚未关闭），确保消费者不会永久阻塞。
 func (r *Reassembler) retryReassemble(sb *SessionBuffer) {
-	defer sb.retrying.Store(false)
+	// retryExit 统一退出：设 retrying=false，按需关 output
+	retryExit := func(locked bool) {
+		if !locked {
+			sb.mu.Lock()
+		}
+		sb.retrying = false
+		if !sb.outputClosed {
+			select {
+			case <-sb.done:
+				// done 已关闭（RemoveSession 或 FIN），关闭 output 通知消费者
+				close(sb.output)
+				sb.outputClosed = true
+			default:
+				// done 未关闭，不关 output（正常放弃发送权路径）
+			}
+		}
+		sb.mu.Unlock()
+	}
 
 	for {
-		// 取出下一个待发送的 chunk（锁内读取状态）
 		sb.mu.Lock()
+
+		// 检查是否已关闭
+		select {
+		case <-sb.done:
+			retryExit(true)
+			return
+		default:
+		}
+
 		chunk, ok := sb.chunks[sb.nextSeq]
 		if !ok {
-			sb.mu.Unlock()
+			// 没有更多有序 chunk，放弃发送权
+			retryExit(true)
 			return
 		}
 		seq := sb.nextSeq
+
+		// 先尝试非阻塞发送（锁内）
+		select {
+		case sb.output <- chunk:
+			sb.flowCtrl.OnBuffered(len(chunk))
+			delete(sb.chunks, seq)
+			sb.nextSeq++
+
+			if sb.finSeq >= 0 && int64(seq) == sb.finSeq {
+				if !sb.outputClosed {
+					close(sb.output)
+					sb.outputClosed = true
+				}
+				sb.doneOnce.Do(func() { close(sb.done) })
+				sb.retrying = false
+				sb.mu.Unlock()
+				return
+			}
+			sb.mu.Unlock()
+			continue
+		default:
+			// channel 仍满，需要阻塞等待
+		}
 		sb.mu.Unlock()
 
-		// 阻塞等待消费者腾出空间
-		sb.output <- chunk
+		// 锁外阻塞发送。安全性保证：
+		// 1. retrying=true，tryReassemble 不会发送（无并发发送者）
+		// 2. nextSeq 未推进，chunk 仍在 map 中（无顺序/丢失问题）
+		// 3. select on done 防止向已关闭通道发送
+		select {
+		case sb.output <- chunk:
+			// 发送成功，加锁更新状态
+			sb.mu.Lock()
+			select {
+			case <-sb.done:
+				// RemoveSession 或 FIN 已关闭 done，停止
+				retryExit(true)
+				return
+			default:
+			}
 
-		// 确认并更新状态
-		sb.mu.Lock()
-		// 确认 nextSeq 未被其他 goroutine 更改
-		if sb.nextSeq != seq {
+			sb.flowCtrl.OnBuffered(len(chunk))
+			delete(sb.chunks, seq)
+			sb.nextSeq++
+
+			if sb.finSeq >= 0 && int64(seq) == sb.finSeq {
+				if !sb.outputClosed {
+					close(sb.output)
+					sb.outputClosed = true
+				}
+				sb.doneOnce.Do(func() { close(sb.done) })
+				sb.retrying = false
+				sb.mu.Unlock()
+				return
+			}
 			sb.mu.Unlock()
+
+		case <-sb.done:
+			// RemoveSession 已关闭 done，退出并关 output
+			retryExit(false)
 			return
 		}
-		sb.flowCtrl.OnBuffered(len(chunk))
-		delete(sb.chunks, seq)
-		sb.nextSeq++
-
-		if sb.finSeq >= 0 && int64(seq) == sb.finSeq {
-			close(sb.output)
-			sb.mu.Unlock()
-			return
-		}
-		sb.mu.Unlock()
 	}
 }
 
@@ -205,6 +299,20 @@ func (r *Reassembler) OnConsumed(sessionID uuid.UUID, n int) {
 }
 
 // RemoveSession 移除会话
+// 关闭 done channel 以通知所有相关 goroutine 退出。
+// 如果没有 retryReassemble 在运行（retrying=false），直接关闭 output 通知消费者。
+// 如果 retryReassemble 在运行，由它在退出时关闭 output，避免并发 send-to-closed-channel。
 func (r *Reassembler) RemoveSession(sessionID uuid.UUID) {
-	r.sessions.Delete(sessionID)
+	val, ok := r.sessions.LoadAndDelete(sessionID)
+	if !ok {
+		return
+	}
+	sb := val.(*SessionBuffer)
+	sb.mu.Lock()
+	sb.doneOnce.Do(func() { close(sb.done) })
+	if !sb.retrying && !sb.outputClosed {
+		close(sb.output)
+		sb.outputClosed = true
+	}
+	sb.mu.Unlock()
 }
