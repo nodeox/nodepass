@@ -1,7 +1,7 @@
 # NodePass 2.0
 
-[![CI](https://github.com/yourusername/nodepass/workflows/CI/badge.svg)](https://github.com/yourusername/nodepass/actions)
-[![Go Report Card](https://goreportcard.com/badge/github.com/yourusername/nodepass)](https://goreportcard.com/report/github.com/yourusername/nodepass)
+[![CI](https://github.com/nodeox/nodepass/workflows/CI/badge.svg)](https://github.com/nodeox/nodepass/actions)
+[![Go Report Card](https://goreportcard.com/badge/github.com/nodeox/nodepass)](https://goreportcard.com/report/github.com/nodeox/nodepass)
 [![License](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 
 NodePass 2.0 是一个生产级分布式边缘网络 SDN Agent，支持多跳、多入多出、带宽聚合和智能路由。
@@ -34,13 +34,12 @@ Transport Layer (传输层: QUIC-First)
 
 ```bash
 # 从源码构建
-git clone https://github.com/yourusername/nodepass.git
+git clone https://github.com/nodeox/nodepass.git
 cd nodepass
-make deps
 make build
 
 # 或使用 go install
-go install github.com/yourusername/nodepass/cmd/nodepass@latest
+go install github.com/nodeox/nodepass/cmd/nodepass@latest
 ```
 
 ### 运行
@@ -68,19 +67,12 @@ go install github.com/yourusername/nodepass/cmd/nodepass@latest
 
 ### 环境要求
 
-- Go 1.22+
+- Go 1.25+
 - Make
-- protoc (用于生成 gRPC 代码)
 
 ### 开发命令
 
 ```bash
-# 安装依赖
-make deps
-
-# 安装开发工具
-make tools
-
 # 运行测试
 make test
 
@@ -113,8 +105,6 @@ nodepass/
 │   ├── control/          # 控制平面
 │   ├── observability/    # 可观测性
 │   └── common/           # 公共组件
-├── pkg/                   # 可导出的包
-├── api/proto/            # gRPC 定义
 ├── configs/              # 配置示例
 ├── test/                 # 测试
 └── docs/                 # 文档
@@ -162,13 +152,14 @@ go tool cover -html=coverage.out
 ## 🙏 致谢
 
 - [quic-go](https://github.com/quic-go/quic-go) - QUIC 协议实现
-- [yamux](https://github.com/hashicorp/yamux) - 多路复用
-- [OpenTelemetry](https://opentelemetry.io/) - 可观测性
+- [gobwas/ws](https://github.com/gobwas/ws) - WebSocket
+- [zap](https://github.com/uber-go/zap) - 结构化日志
+- [Prometheus](https://github.com/prometheus/client_golang) - 指标监控
 
 ## 📞 联系方式
 
-- 问题反馈: [GitHub Issues](https://github.com/yourusername/nodepass/issues)
-- 讨论: [GitHub Discussions](https://github.com/yourusername/nodepass/discussions)
+- 问题反馈: [GitHub Issues](https://github.com/nodeox/nodepass/issues)
+- 讨论: [GitHub Discussions](https://github.com/nodeox/nodepass/discussions)
 
 ---
 
