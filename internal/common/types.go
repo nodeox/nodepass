@@ -28,6 +28,9 @@ type InboundHandler interface {
 
 	// Addr 获取监听地址
 	Addr() net.Addr
+
+	// WaitReady 阻塞直到 listener 绑定成功
+	WaitReady()
 }
 
 // OutboundHandler 出站处理器接口
@@ -202,4 +205,46 @@ type AuthConfig struct {
 type UserAuth struct {
 	Username string `yaml:"username"`
 	Password string `yaml:"password"`
+}
+
+// DeepCopy 返回 Config 的深拷贝
+func (c *Config) DeepCopy() *Config {
+	if c == nil {
+		return nil
+	}
+	cp := *c
+
+	// Node.Tags
+	if c.Node.Tags != nil {
+		cp.Node.Tags = make(map[string]string, len(c.Node.Tags))
+		for k, v := range c.Node.Tags {
+			cp.Node.Tags[k] = v
+		}
+	}
+
+	// Inbounds
+	if c.Inbounds != nil {
+		cp.Inbounds = make([]InboundConfig, len(c.Inbounds))
+		for i, in := range c.Inbounds {
+			cp.Inbounds[i] = in
+			if in.Auth.Users != nil {
+				cp.Inbounds[i].Auth.Users = make([]UserAuth, len(in.Auth.Users))
+				copy(cp.Inbounds[i].Auth.Users, in.Auth.Users)
+			}
+		}
+	}
+
+	// Outbounds
+	if c.Outbounds != nil {
+		cp.Outbounds = make([]OutboundConfig, len(c.Outbounds))
+		copy(cp.Outbounds, c.Outbounds)
+	}
+
+	// Routing.Rules
+	if c.Routing.Rules != nil {
+		cp.Routing.Rules = make([]RoutingRule, len(c.Routing.Rules))
+		copy(cp.Routing.Rules, c.Routing.Rules)
+	}
+
+	return &cp
 }
